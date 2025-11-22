@@ -1,0 +1,210 @@
+require('dotenv').config();
+const { Telegraf } = require('telegraf');
+const { ethers } = require('ethers');
+const sqlite3 = require('sqlite3').verbose();
+
+// Load environment variables
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const RPC_URL = process.env.RPC_URL;
+const CHAT_ID = process.env.CHAT_ID; // Optional: for logging to a specific chat
+const DB_PATH = process.env.DB_PATH || './faucet.db';
+
+// Constants
+const FAUCET_AMOUNT = ethers.utils.parseEther('0.2'); // 0.2 Sepolia ETH
+const COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+
+// Initialize Ethereum provider and wallet
+const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
+const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+
+// Initialize SQLite database
+const db = new sqlite3.Database(DB_PATH);
+
+// Create tables for cooldowns
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS user_cooldowns (
+    user_id INTEGER PRIMARY KEY,
+    last_request TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS address_cooldowns (
+    address TEXT PRIMARY KEY,
+    last_request TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`);
+});
+
+// Initialize bot
+const bot = new Telegraf(BOT_TOKEN);
+
+// Welcome message
+bot.start((ctx) => ctx.reply(
+  `Welcome to the Sepolia Faucet Bot! 🚰\n\n` +
+  `Claim up to 0.2 Sepolia ETH every 24 hours to test your Ethereum projects on the Sepolia testnet.\n\n` +
+  `Simply enter your wallet address and follow the prompts to get your free testnet tokens.\n\n` +
+  `Start building and experimenting now! 💻`
+));
+
+// Handle any message that looks like an Ethereum address
+bot.on('text', async (ctx) => {
+  const chatId = ctx.chat.id;  // Always use the current chat
+  const userId = ctx.from.id;
+  const now = Date.now();
+  const address = ctx.message.text.trim().toLowerCase();
+
+  // Only process if it's a valid Ethereum address
+  if (!ethers.utils.isAddress(address)) {
+    // Silently ignore non-Ethereum addresses
+    return;
+  }
+
+  try {
+    // Announce to the group who is requesting
+    await ctx.telegram.sendMessage(
+      chatId,
+      `@${ctx.from.username || ctx.from.first_name} requested Sepolia for address: ${address}`
+    );
+
+    // Check user cooldown
+    const userRow = await new Promise((resolve, reject) => {
+      db.get(
+        'SELECT last_request FROM user_cooldowns WHERE user_id = ?',
+        [userId],
+        (err, row) => (err ? reject(err) : resolve(row))
+      );
+    });
+
+    const userLastRequest = userRow ? new Date(userRow.last_request).getTime() : 0;
+    // User cooldown
+    if (now - userLastRequest < COOLDOWN_MS) {
+      const timeLeft = Math.floor((COOLDOWN_MS - (now - userLastRequest)) / (1000 * 60 * 60));
+      return ctx.telegram.sendMessage(chatId, `⏳ You must wait ${timeLeft} hours before your next request.`);
+    }
+
+    // Check address cooldown
+    const addrRow = await new Promise((resolve, reject) => {
+      db.get(
+        'SELECT last_request FROM address_cooldowns WHERE address = ?',
+        [address],
+        (err, row) => (err ? reject(err) : resolve(row))
+      );
+    });
+
+    const addrLastRequest = addrRow ? new Date(addrRow.last_request).getTime() : 0;
+    // Address cooldown
+    if (now - addrLastRequest < COOLDOWN_MS) {
+      const timeLeft = Math.floor((COOLDOWN_MS - (now - addrLastRequest)) / (1000 * 60 * 60));
+      return ctx.telegram.sendMessage(chatId, `⏳ This address must wait ${timeLeft} hours before its next request.`);
+    }
+
+    // Check faucet balance
+    const balance = await provider.getBalance(wallet.address);
+    if (balance < FAUCET_AMOUNT) {
+      return ctx.telegram.sendMessage(chatId, '❌ Faucet is out of funds. Please try later.');
+    }
+
+    // Announce sending
+    await ctx.telegram.sendMessage(chatId, `⏳ Sending 0.2 Sepolia ETH to ${address}... Please wait.`);
+
+    const tx = await wallet.sendTransaction({
+      to: address,
+      value: FAUCET_AMOUNT,
+    });
+
+    const receipt = await tx.wait();
+    if (receipt.status === 1) {
+      // Update cooldowns
+      await new Promise((resolve, reject) => {
+        db.run(
+          'INSERT OR REPLACE INTO user_cooldowns (user_id, last_request) VALUES (?, datetime("now"))',
+          [userId],
+          (err) => (err ? reject(err) : resolve())
+        );
+      });
+
+      await new Promise((resolve, reject) => {
+        db.run(
+          'INSERT OR REPLACE INTO address_cooldowns (address, last_request) VALUES (?, datetime("now"))',
+          [address],
+          (err) => (err ? reject(err) : resolve())
+        );
+      });
+
+      await ctx.telegram.sendMessage(
+        chatId,
+        `✅ Sent 0.2 Sepolia ETH to ${address}\n` +
+        `Tx: https://sepolia.etherscan.io/tx/${tx.hash}\n` +
+        `Next request in 24 hours.`
+      );
+    } else {
+      await ctx.telegram.sendMessage(chatId, '❌ Transaction failed. Please try again.');
+    }
+  } catch (error) {
+    console.error('Transaction error:', error);
+    
+    // Handle specific error cases
+    if (error.code === 'INSUFFICIENT_FUNDS') {
+      await ctx.telegram.sendMessage(chatId, '❌ Faucet has insufficient funds for this transaction.');
+    } else if (error.code === 'NETWORK_ERROR') {
+      await ctx.telegram.sendMessage(chatId, '❌ Network error. Please try again in a few minutes.');
+    } else if (error.message && error.message.includes('nonce')) {
+      await ctx.telegram.sendMessage(chatId, '❌ Transaction nonce error. Please try again.');
+    } else {
+      await ctx.telegram.sendMessage(chatId, '❌ Transaction failed. Please try again later.');
+    }
+  }
+});
+
+// Handle any message that is not an Ethereum address
+bot.on('message', (ctx) => {
+  if (ctx.message.text && ctx.message.text.startsWith('/start')) {
+    return; // Skip, as /start is handled by bot.start()
+  }
+  ctx.reply('Please send a valid Sepolia ETH address to receive test ETH.');
+});
+
+// Error handling
+bot.catch(async (err, ctx) => {
+  console.error('Bot error:', err);
+  
+  try {
+    if (err.code === 'ETELEGRAM') {
+      await ctx.telegram.sendMessage(ctx.chat.id, '❌ Telegram API error. Please try again.');
+    } else if (err.message && err.message.includes('database')) {
+      await ctx.telegram.sendMessage(ctx.chat.id, '❌ Database error. Please try again.');
+    } else {
+      await ctx.telegram.sendMessage(ctx.chat.id, '❌ An error occurred. Please try again later.');
+    }
+  } catch (e) {
+    console.error('Error in error handler:', e);
+  }
+});
+
+// Start the bot
+console.log('Bot script started');
+console.log('Bot token:', BOT_TOKEN ? 'Present' : 'Missing');
+
+// Add error handler for uncaught promises
+process.on('unhandledRejection', (error) => {
+  console.error('Unhandled promise rejection:', error);
+});
+
+console.log('About to launch bot');
+bot.launch()
+  .then(() => {
+    console.log('Bot is running!');
+    console.log('Bot username:', bot.botInfo?.username);
+  })
+  .catch((error) => {
+    console.error('Failed to start bot:', error);
+    process.exit(1);
+  });
+
+// Handle shutdown
+process.once('SIGINT', () => {
+  bot.stop('SIGINT');
+  db.close();
+});
+process.once('SIGTERM', () => {
+  bot.stop('SIGTERM');
+  db.close();
+});
