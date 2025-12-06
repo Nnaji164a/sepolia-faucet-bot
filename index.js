@@ -1,3 +1,13 @@
+const express = require('express');
+const app = express();
+
+app.get('/', (req, res) => {
+  res.send('Sepolia Faucet Bot is running 24/7 ✓');
+});
+
+app.listen(process.env.PORT || 8080);
+console.log('Keep-alive server started on port', process.env.PORT || 8080);
+
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const { ethers } = require('ethers');
@@ -34,7 +44,25 @@ db.serialize(() => {
 });
 
 // Initialize bot
-const bot = new Telegraf(BOT_TOKEN);
+const bot = new Telegraf(BOT_TOKEN);// Simple keep-alive HTTP endpoint for UptimeRobot / Replit
+const http = require('http');
+const KEEPALIVE_PORT = process.env.PORT || 3000;
+
+const server = http.createServer((req, res) => {
+  if (req.method === 'GET' && req.url === '/health') {
+    // return 200 so monitoring services know the repl is alive
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    return res.end('OK');
+  }
+
+  // optional root page for humans
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Sepolia Faucet is running');
+});
+
+server.listen(KEEPALIVE_PORT, () => {
+  console.log(`Keepalive server listening on port ${KEEPALIVE_PORT}`);
+});
 
 // Welcome message
 bot.start((ctx) => ctx.reply(
